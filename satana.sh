@@ -195,6 +195,7 @@ wps_attack_script_file="ag.wpsattack.sh"
 wps_out_file="ag.wpsout.txt"
 timeout_secs_per_pin="30"
 timeout_secs_per_pixiedust="30"
+timeout_secs_per_bruteforce="86400"
 
 #Repository and contact vars
 repository_hostname="github.com"
@@ -941,6 +942,83 @@ function is_valid_wifi_interface() {
 	[ -n "${1}" ] && [ -d "/sys/class/net/${1}" ] && check_interface_wifi "${1}"
 }
 
+#Check if interface is a USB wifi adapter
+function is_usb_wifi_interface() {
+
+	debug_print
+
+	local iface="${1}"
+	local bus_type
+
+	[ -n "${iface}" ] || return 1
+
+	if [ -f "/sys/class/net/${iface}/device/modalias" ]; then
+		bus_type=$(cut -f 1 -d ":" < "/sys/class/net/${iface}/device/modalias")
+		[ "${bus_type}" = "usb" ] && return 0
+	fi
+
+	[ -f "/sys/class/net/${iface}/device/idVendor" ] && [ -f "/sys/class/net/${iface}/device/idProduct" ]
+}
+
+#Bring up wifi interfaces so USB adapters are visible before selection
+function prepare_wifi_interfaces_for_selection() {
+
+	debug_print
+
+	local net_iface
+	local attempt
+
+	disable_rfkill
+
+	for net_iface in /sys/class/net/*; do
+		net_iface=$(basename "${net_iface}")
+		case "${net_iface}" in
+			lo|docker*|br*|veth*|tun*|tap*)
+				continue
+			;;
+		esac
+		if [ -e "/sys/class/net/${net_iface}/phy80211" ] || is_wlan0_interface "${net_iface}"; then
+			ip link set "${net_iface}" up > /dev/null 2>&1
+		fi
+	done
+
+	for attempt in 1 2 3; do
+		readarray -t _wifi_probe < <(collect_wifi_interface_names)
+		[ "${#_wifi_probe[@]}" -gt 0 ] && break
+		sleep 1
+	done
+}
+
+#Collect wifi interface names from iw and sysfs
+function collect_wifi_interface_names() {
+
+	debug_print
+
+	local iface
+	local -A seen_ifaces=()
+
+	while IFS= read -r iface; do
+		[ -n "${iface}" ] || continue
+		if [ -z "${seen_ifaces[${iface}]}" ]; then
+			seen_ifaces["${iface}"]=1
+			echo "${iface}"
+		fi
+	done < <(
+		iw dev 2> /dev/null | awk '/Interface/{print $2}'
+		for phy_path in /sys/class/ieee80211/*; do
+			[ -d "${phy_path}/device/net" ] || continue
+			for iface_path in "${phy_path}/device/net/"*; do
+				[ -e "${iface_path}" ] || continue
+				basename "${iface_path}"
+			done
+		done
+		for net_path in /sys/class/net/*; do
+			[ -e "${net_path}/phy80211" ] || continue
+			basename "${net_path}"
+		done
+	)
+}
+
 #Check if an interface should be offered in the selection menu
 function is_selectable_wifi_interface() {
 
@@ -950,7 +1028,6 @@ function is_selectable_wifi_interface() {
 	local phy
 
 	[ -n "${iface}" ] || return 1
-	check_interface_wifi "${iface}" || return 1
 
 	case "${iface}" in
 		p2p*|rmnet*|r_rmnet*|dummy*|lo|docker*|br*|veth*|tun*|tap*)
@@ -958,12 +1035,20 @@ function is_selectable_wifi_interface() {
 		;;
 	esac
 
+	ip link set "${iface}" up > /dev/null 2>&1
+	check_interface_wifi "${iface}" || return 1
+
 	if is_wlan0_interface "${iface}"; then
 		return 0
 	fi
 
 	phy=$(physical_interface_finder "${iface}")
 	[ -n "${phy}" ] || return 1
+
+	if is_usb_wifi_interface "${iface}"; then
+		return 0
+	fi
+
 	iw phy "${phy}" info 2>/dev/null | grep -q "monitor" || return 1
 
 	return 0
@@ -1559,11 +1644,50 @@ function set_wps_mac_parameters() {
 	four_wpsbssid_last_digits_clean=${four_wpsbssid_last_digits//:}
 }
 
+#Check if a PID is still running (portable: Linux, Kali NetHunter, Termux)
+function is_pid_running() {
+
+	debug_print
+
+	[ -n "${1}" ] && kill -0 "${1}" 2>/dev/null
+}
+
+#Stop wash json scan child processes and remove temp fifo
+function cleanup_wash_json_scan() {
+
+	debug_print
+
+	if [ -n "${wash_json_pid:-}" ] && is_pid_running "${wash_json_pid}"; then
+		kill -s SIGTERM "${wash_json_pid}" 2>/dev/null
+		wait "${wash_json_pid}" 2>/dev/null
+	fi
+	if [ -n "${wash_json_tee_pid:-}" ] && is_pid_running "${wash_json_tee_pid}"; then
+		kill -s SIGTERM "${wash_json_tee_pid}" 2>/dev/null
+		wait "${wash_json_tee_pid}" 2>/dev/null
+	fi
+	rm -f "${tmpdir}wps_fifo" 2>/dev/null
+}
+
+#Sanitize ESSID for safe use in filenames
+function sanitize_wps_essid_for_filename() {
+
+	debug_print
+
+	local safe_name
+	safe_name=$(printf '%s' "${1}" | tr -cs '[:alnum:]._-' '_' | sed -e 's/^_\+//' -e 's/_\+$//')
+	if [ -z "${safe_name}" ] || [ "${1}" = "(Hidden Network)" ]; then
+		printf '%s' "${wps_bssid}"
+	else
+		printf '%s' "${safe_name}"
+	fi
+}
+
 #Check if wash has json option
 function check_json_option_on_wash() {
 
 	debug_print
 
+	hash wash 2>/dev/null || return 1
 	wash -h 2>&1 | grep "\-j" > /dev/null
 	return $?
 }
@@ -1573,6 +1697,7 @@ function check_dual_scan_on_wash() {
 
 	debug_print
 
+	hash wash 2>/dev/null || return 1
 	wash -h 2>&1 | grep "2ghz" > /dev/null
 	return $?
 }
@@ -1582,44 +1707,56 @@ function wash_json_scan() {
 
 	debug_print
 
+	if ! hash wash 2>/dev/null; then
+		return 1
+	fi
+
 	tmpfiles_toclean=1
+	cleanup_wash_json_scan 2>/dev/null
 	rm -rf "${tmpdir}wps_json_data.txt" > /dev/null 2>&1
-	rm -rf "${tmpdir}wps_fifo" > /dev/null 2>&1
 
 	mkfifo "${tmpdir}wps_fifo"
 
 	wash_band_modifier=""
-	if [ "${wps_channel}" -gt 14 ]; then
+	if [[ "${wps_channel}" =~ ^[0-9]+$ ]] && [ "${wps_channel}" -gt 14 ]; then
 		if [ "${interfaces_band_info['main_wifi_interface','5Ghz_allowed']}" -eq 0 ]; then
 			echo
 			language_strings "${language}" 515 "red"
 			language_strings "${language}" 115 "read"
+			cleanup_wash_json_scan
 			return 1
 		else
 			wash_band_modifier="-5"
 		fi
 	fi
 
+	serial=""
 	timeout -s SIGTERM 240 wash -i "${interface}" --scan -n 100 -j "${wash_band_modifier}" 2> /dev/null > "${tmpdir}wps_fifo" &
 	wash_json_pid=$!
-	tee "${tmpdir}wps_json_data.txt"< <(cat < "${tmpdir}wps_fifo") > /dev/null 2>&1 &
+	tee "${tmpdir}wps_json_data.txt" < "${tmpdir}wps_fifo" > /dev/null 2>&1 &
+	wash_json_tee_pid=$!
 
-	while true; do
+	local scan_elapsed=0
+	while [ "${scan_elapsed}" -lt 250 ]; do
 		sleep 5
-		wash_json_capture_alive=$(ps uax | awk '{print $2}' | grep -E "^${wash_json_pid}$" 2> /dev/null)
-		if [ -z "${wash_json_capture_alive}" ]; then
+		scan_elapsed=$((scan_elapsed + 5))
+
+		if ! is_pid_running "${wash_json_pid}"; then
 			break
 		fi
 
-		if grep "${1}" "${tmpdir}wps_json_data.txt" > /dev/null; then
-			serial=$(grep "${1}" "${tmpdir}wps_json_data.txt" | awk -F '"wps_serial" : "' '{print $2}' | awk -F '"' '{print $1}' | sed 's/.*\(....\)/\1/' 2> /dev/null)
-			kill "${wash_json_capture_alive}" &> /dev/null
-			wait "${wash_json_capture_alive}" 2> /dev/null
+		if [ -f "${tmpdir}wps_json_data.txt" ] && grep -q "${1}" "${tmpdir}wps_json_data.txt" 2>/dev/null; then
+			serial=$(grep "${1}" "${tmpdir}wps_json_data.txt" | awk -F '"wps_serial" : "' '{print $2}' | awk -F '"' '{print $1}' | sed 's/.*\(....\)/\1/' 2> /dev/null | head -n1)
 			break
 		fi
 	done
 
-	return 0
+	cleanup_wash_json_scan
+
+	if [ -n "${serial}" ]; then
+		return 0
+	fi
+	return 1
 }
 
 #Calculate pin based on Zhao Chunsheng algorithm (ComputePIN), step 1
@@ -3212,7 +3349,8 @@ function select_interface() {
 	current_menu="select_interface_menu"
 	language_strings "${language}" 24 "green"
 	print_simple_separator
-	readarray -t all_ifaces < <(iw dev 2> /dev/null | awk '/Interface/{print $2}')
+	prepare_wifi_interfaces_for_selection
+	readarray -t all_ifaces < <(collect_wifi_interface_names)
 	ifaces=()
 	for item in "${all_ifaces[@]}"; do
 		if is_selectable_wifi_interface "${item}"; then
@@ -3360,7 +3498,11 @@ function ask_channel() {
 	fi
 
 	if [ "${1}" = "wps" ]; then
-		if [[ -n "${wps_channel}" ]] && [[ "${wps_channel}" -gt 14 ]]; then
+		if [[ "${wps_channel}" = "-" ]] || [[ "${wps_channel}" = "0" ]]; then
+			wps_channel=""
+		fi
+
+		if [[ -n "${wps_channel}" ]] && [[ "${wps_channel}" =~ ^[0-9]+$ ]] && [[ "${wps_channel}" -gt 14 ]]; then
 			if [ "${interfaces_band_info['main_wifi_interface','5Ghz_allowed']}" -eq 0 ]; then
 				echo
 				language_strings "${language}" 515 "red"
@@ -4714,7 +4856,7 @@ function exec_wps_custom_pin_bully_attack() {
 	echo
 	language_strings "${language}" 32 "green"
 
-	set_wps_attack_script "bully" "custompin"
+	set_wps_attack_script "bully" "custompin" || return
 
 	echo
 	language_strings "${language}" 33 "yellow"
@@ -4732,7 +4874,7 @@ function exec_wps_custom_pin_reaver_attack() {
 	echo
 	language_strings "${language}" 32 "green"
 
-	set_wps_attack_script "reaver" "custompin"
+	set_wps_attack_script "reaver" "custompin" || return
 
 	echo
 	language_strings "${language}" 33 "yellow"
@@ -4750,7 +4892,7 @@ function exec_bully_pixiewps_attack() {
 	echo
 	language_strings "${language}" 32 "green"
 
-	set_wps_attack_script "bully" "pixiedust"
+	set_wps_attack_script "bully" "pixiedust" || return
 
 	echo
 	language_strings "${language}" 33 "yellow"
@@ -4768,7 +4910,7 @@ function exec_reaver_pixiewps_attack() {
 	echo
 	language_strings "${language}" 32 "green"
 
-	set_wps_attack_script "reaver" "pixiedust"
+	set_wps_attack_script "reaver" "pixiedust" || return
 
 	echo
 	language_strings "${language}" 33 "yellow"
@@ -4786,7 +4928,7 @@ function exec_wps_bruteforce_pin_bully_attack() {
 	echo
 	language_strings "${language}" 32 "green"
 
-	set_wps_attack_script "bully" "bruteforce"
+	set_wps_attack_script "bully" "bruteforce" || return
 
 	echo
 	language_strings "${language}" 33 "yellow"
@@ -4804,7 +4946,7 @@ function exec_wps_bruteforce_pin_reaver_attack() {
 	echo
 	language_strings "${language}" 32 "green"
 
-	set_wps_attack_script "reaver" "bruteforce"
+	set_wps_attack_script "reaver" "bruteforce" || return
 
 	echo
 	language_strings "${language}" 33 "yellow"
@@ -4821,7 +4963,7 @@ function exec_wps_pin_database_bully_attack() {
 
 	wps_pin_database_prerequisites
 
-	set_wps_attack_script "bully" "pindb"
+	set_wps_attack_script "bully" "pindb" || return
 
 	recalculate_windows_sizes
 	manage_output "-hold -bg \"#000000\" -fg \"#FF0000\" -geometry ${g2_stdright_window} -T \"WPS bully known pins database based attack\"" "bash \"${tmpdir}${wps_attack_script_file}\"" "WPS bully known pins database based attack" "active"
@@ -4835,7 +4977,7 @@ function exec_wps_pin_database_reaver_attack() {
 
 	wps_pin_database_prerequisites
 
-	set_wps_attack_script "reaver" "pindb"
+	set_wps_attack_script "reaver" "pindb" || return
 
 	recalculate_windows_sizes
 	manage_output "-hold -bg \"#000000\" -fg \"#FF0000\" -geometry ${g2_stdright_window} -T \"WPS reaver known pins database based attack\"" "bash \"${tmpdir}${wps_attack_script_file}\"" "WPS reaver known pins database based attack" "active"
@@ -4850,7 +4992,7 @@ function exec_reaver_nullpin_attack() {
 	echo
 	language_strings "${language}" 32 "green"
 
-	set_wps_attack_script "reaver" "nullpin"
+	set_wps_attack_script "reaver" "nullpin" || return
 
 	echo
 	language_strings "${language}" 33 "yellow"
@@ -6873,6 +7015,7 @@ function wps_attacks_menu() {
 				forbidden_menu_option
 			else
 				wps_attack="custompin_reaver"
+				get_reaver_version
 				if wps_attacks_parameters; then
 					manage_wps_log
 					exec_wps_custom_pin_reaver_attack
@@ -7080,7 +7223,7 @@ function offline_pin_generation_menu() {
 			managed_option "${interface}"
 		;;
 		4)
-			if contains_element "${wps_option}" "${forbidden_options[@]}"; then
+			if contains_element "${offline_pin_generation_option}" "${forbidden_options[@]}"; then
 				forbidden_menu_option
 			else
 				get_reaver_version
@@ -8432,7 +8575,7 @@ function manage_wps_log() {
 	if [ -z "${wps_essid}" ]; then
 		wpspot_filename="wps_captured_key-${wps_bssid}.txt"
 	else
-		wpspot_filename="wps_captured_key-${wps_essid}.txt"
+		wpspot_filename="wps_captured_key-$(sanitize_wps_essid_for_filename "${wps_essid}").txt"
 	fi
 	wps_potpath="${wps_potpath}${wpspot_filename}"
 
@@ -9809,12 +9952,16 @@ function set_wps_attack_script() {
 
 	debug_print
 
+	if ! hash "${1}" 2>/dev/null; then
+		return 1
+	fi
+
 	tmpfiles_toclean=1
 	rm -rf "${tmpdir}${wps_attack_script_file}" > /dev/null 2>&1
 	rm -rf "${tmpdir}${wps_out_file}" > /dev/null 2>&1
 
 	bully_reaver_band_modifier=""
-	if [[ "${wps_channel}" -gt 14 ]] && [[ "${interfaces_band_info['main_wifi_interface','5Ghz_allowed']}" -eq 1 ]]; then
+	if [[ "${wps_channel}" =~ ^[0-9]+$ ]] && [[ "${wps_channel}" -gt 14 ]] && [[ "${interfaces_band_info['main_wifi_interface','5Ghz_allowed']}" -eq 1 ]]; then
 		bully_reaver_band_modifier="-5"
 	fi
 
@@ -9853,7 +10000,7 @@ function set_wps_attack_script() {
 		esac
 	fi
 
-	attack_cmd2=" | tee ${tmpdir}${wps_out_file}"
+	attack_cmd2=" | tee \"${tmpdir}${wps_out_file}\""
 
 	cat >&7 <<-EOF
 		#!/usr/bin/env bash
@@ -9873,7 +10020,7 @@ function set_wps_attack_script() {
 
 	cat >&7 <<-EOF
 			"pindb")
-				script_pins_found=(${pins_found[@]})
+				script_pins_found=("${pins_found[@]}")
 				script_attack_cmd1="${unbuffer}timeout -s SIGTERM ${timeout_secs_per_pin} ${attack_cmd1}"
 				pin_header1="${white_color}Testing PIN "
 			;;
@@ -9887,7 +10034,7 @@ function set_wps_attack_script() {
 				pin_header1="${white_color}Testing Pixie Dust attack${normal_color}"
 			;;
 			"bruteforce")
-				script_attack_cmd1="${unbuffer} ${attack_cmd1}"
+				script_attack_cmd1="${unbuffer}timeout -s SIGTERM ${timeout_secs_per_bruteforce} ${attack_cmd1}"
 				pin_header1="${white_color}Testing all possible PINs${normal_color}"
 			;;
 			"nullpin")
@@ -10181,7 +10328,10 @@ function set_wps_attack_script() {
 				if [ "${script_wps_attack_tool}" = "bully" ]; then
 					echo
 				fi
-				eval "${script_attack_cmd1}${script_attack_cmd2} ${colorize}"
+				(set -o pipefail && eval "${script_attack_cmd1}${script_attack_cmd2} ${colorize}")
+				if [ "$?" = "124" ]; then
+					this_pin_timeout=1
+				fi
 				parse_output
 			;;
 			"nullpin")
@@ -12696,10 +12846,17 @@ function explore_for_wps_targets_option() {
 		return 1
 	fi
 
+	if ! hash wash 2>/dev/null; then
+		echo
+		language_strings "${language}" 492 "red"
+		language_strings "${language}" 115 "read"
+		return 1
+	fi
+
 	echo
 	language_strings "${language}" 66 "yellow"
 	echo
-	if ! grep -qe "${interface}" <(echo "${!wash_ifaces_already_set[@]}"); then
+	if [ -z "${wash_ifaces_already_set[${interface}]+x}" ]; then
 		language_strings "${language}" 353 "blue"
 		set_wash_parameterization
 		language_strings "${language}" 354 "yellow"
@@ -12785,20 +12942,29 @@ function explore_for_wps_targets_option() {
 			fi
 
 			expwps_bssid=$(echo "${expwps_line}" | awk '{print $1}')
-			expwps_channel=$(echo "${expwps_line}" | awk '{print $2}')
+			expwps_channel_num=$(echo "${expwps_line}" | awk '{print $2}')
 			expwps_power=$(echo "${expwps_line}" | awk '{print $3}')
 			expwps_locked=$(echo "${expwps_line}" | awk '{print $5}')
-			expwps_essid=$(echo "${expwps_line//[\`\']/}" | awk -F '\t| {2,}' '{print $NF}')
+			expwps_essid=$(echo "${expwps_line}" | awk '{$1=$2=$3=$4=$5=$6=$7=""; sub(/^[[:space:]]+/, ""); gsub(/^[\047`"]|[\047`"]$/, ""); print}')
+			if [ -z "${expwps_essid}" ]; then
+				expwps_essid="(Hidden Network)"
+			fi
 
-			if [[ ${expwps_channel} -le 9 ]]; then
-				wpssp2="  "
-				if [[ ${expwps_channel} -eq 0 ]]; then
-					expwps_channel="-"
+			display_channel="${expwps_channel_num}"
+			if [[ "${expwps_channel_num}" =~ ^[0-9]+$ ]]; then
+				if [[ ${expwps_channel_num} -le 9 ]]; then
+					wpssp2="  "
+					if [[ ${expwps_channel_num} -eq 0 ]]; then
+						display_channel="-"
+					fi
+				elif [[ ${expwps_channel_num} -ge 10 ]] && [[ ${expwps_channel_num} -lt 99 ]]; then
+					wpssp2=" "
+				else
+					wpssp2=""
 				fi
-			elif [[ ${expwps_channel} -ge 10 ]] && [[ ${expwps_channel} -lt 99 ]]; then
-				wpssp2=" "
 			else
-				wpssp2=""
+				wpssp2=" "
+				display_channel="-"
 			fi
 
 			if [[ "${expwps_power}" = "" ]] || [[ "${expwps_power}" = "-00" ]]; then
@@ -12809,9 +12975,9 @@ function explore_for_wps_targets_option() {
 				expwps_power=${expwps_power//0/}
 			fi
 
-			if [[ ${expwps_power} -lt 0 ]]; then
+			if [[ "${expwps_power}" =~ ^-?[0-9]+$ ]] && [[ ${expwps_power} -lt 0 ]]; then
 				if [[ ${expwps_power} -eq -1 ]]; then
-					exp_power=0
+					expwps_power=0
 				else
 					expwps_power=$((expwps_power + 100))
 				fi
@@ -12831,11 +12997,15 @@ function explore_for_wps_targets_option() {
 				wpssp3=" "
 			fi
 
-			wps_network_names[$wash_counter]=${expwps_essid}
-			wps_channels[$wash_counter]=${expwps_channel}
-			wps_macs[$wash_counter]=${expwps_bssid}
-			wps_lockeds[$wash_counter]=${expwps_locked}
-			echo -e "${wash_color} ${wpssp1}${wash_counter})   ${expwps_bssid}  ${wpssp2}${expwps_channel}    ${wpssp4}${expwps_power}%     ${expwps_locked}${wpssp3}   ${expwps_essid}"
+			wps_network_names[$wash_counter]="${expwps_essid}"
+			if [[ "${expwps_channel_num}" =~ ^[0-9]+$ ]] && [[ ${expwps_channel_num} -gt 0 ]]; then
+				wps_channels[$wash_counter]="${expwps_channel_num}"
+			else
+				wps_channels[$wash_counter]=""
+			fi
+			wps_macs[$wash_counter]="${expwps_bssid}"
+			wps_lockeds[$wash_counter]="${expwps_locked}"
+			echo -e "${wash_color} ${wpssp1}${wash_counter})   ${expwps_bssid}  ${wpssp2}${display_channel}    ${wpssp4}${expwps_power}%     ${expwps_locked}${wpssp3}   ${expwps_essid}"
 		fi
 	done < "${tmpdir}wps.txt"
 
@@ -12873,10 +13043,10 @@ function explore_for_wps_targets_option() {
 		read -rp "> " selected_wps_target_network
 	done
 
-	wps_essid=${wps_network_names[${selected_wps_target_network}]}
-	wps_channel=${wps_channels[${selected_wps_target_network}]}
-	wps_bssid=${wps_macs[${selected_wps_target_network}]}
-	wps_locked=${wps_lockeds[${selected_wps_target_network}]}
+	wps_essid="${wps_network_names[${selected_wps_target_network}]}"
+	wps_channel="${wps_channels[${selected_wps_target_network}]}"
+	wps_bssid="${wps_macs[${selected_wps_target_network}]}"
+	wps_locked="${wps_lockeds[${selected_wps_target_network}]}"
 }
 
 #Create a menu to select target from the parsed data
@@ -12983,6 +13153,10 @@ function set_wash_parameterization() {
 
 	fcs=""
 	declare -gA wash_ifaces_already_set
+	if ! hash wash 2>/dev/null; then
+		wash_ifaces_already_set["${interface}"]="${fcs}"
+		return
+	fi
 	readarray -t WASH_OUTPUT < <(timeout -s SIGTERM 2 wash -i "${interface}" 2> /dev/null)
 
 	for item in "${WASH_OUTPUT[@]}"; do
@@ -12992,7 +13166,7 @@ function set_wash_parameterization() {
 		fi
 	done
 
-	wash_ifaces_already_set[${interface}]=${fcs}
+	wash_ifaces_already_set["${interface}"]="${fcs}"
 }
 
 #Check if a type exists in the wps data array
@@ -13863,8 +14037,11 @@ function get_bully_version() {
 
 	debug_print
 
-	bully_version=$(bully -V 2> /dev/null)
-	bully_version=${bully_version#"v"}
+	bully_version=""
+	if hash bully 2>/dev/null; then
+		bully_version=$(bully -V 2>/dev/null)
+		bully_version=${bully_version#"v"}
+	fi
 }
 
 #Determine reaver version
@@ -13872,11 +14049,23 @@ function get_reaver_version() {
 
 	debug_print
 
-	reaver_version=$(reaver -h 2>&1 > /dev/null | grep -E "^Reaver v[0-9]" | awk '{print $2}' | grep -Eo "v[0-9\.]+")
-	if [ -z "${reaver_version}" ]; then
-		reaver_version=$(reaver -h 2> /dev/null | grep -E "^Reaver v[0-9]" | awk '{print $2}' | grep -Eo "v[0-9\.]+")
+	reaver_version=""
+	if hash reaver 2>/dev/null; then
+		reaver_version=$(reaver -h 2>&1 | grep -E "^Reaver v[0-9]" | head -n1 | awk '{print $2}' | grep -Eo "v[0-9\.]+")
+		reaver_version=${reaver_version#"v"}
 	fi
-	reaver_version=${reaver_version#"v"}
+}
+
+#Determine wash version
+function get_wash_version() {
+
+	debug_print
+
+	wash_version=""
+	if hash wash 2>/dev/null; then
+		wash_version=$(wash -h 2>&1 | grep -E "^Wash[[:space:]]v[0-9]" | head -n1 | awk '{print $2}' | grep -Eo "v[0-9\.]+")
+		wash_version=${wash_version#"v"}
+	fi
 }
 
 #Set verbosity for bully based on version
@@ -13896,6 +14085,12 @@ function validate_bully_pixiewps_version() {
 
 	debug_print
 
+	if ! hash bully 2>/dev/null; then
+		return 1
+	fi
+	if ! hash pixiewps 2>/dev/null; then
+		return 1
+	fi
 	if compare_floats_greater_or_equal "${bully_version}" "${minimum_bully_pixiewps_version}"; then
 		return 0
 	fi
@@ -13907,6 +14102,12 @@ function validate_reaver_pixiewps_version() {
 
 	debug_print
 
+	if ! hash reaver 2>/dev/null; then
+		return 1
+	fi
+	if ! hash pixiewps 2>/dev/null; then
+		return 1
+	fi
 	if compare_floats_greater_or_equal "${reaver_version}" "${minimum_reaver_pixiewps_version}"; then
 		return 0
 	fi
@@ -13918,6 +14119,9 @@ function validate_reaver_nullpin_version() {
 
 	debug_print
 
+	if ! hash reaver 2>/dev/null; then
+		return 1
+	fi
 	if compare_floats_greater_or_equal "${reaver_version}" "${minimum_reaver_nullpin_version}"; then
 		return 0
 	fi
@@ -13929,7 +14133,8 @@ function validate_wash_dualscan_version() {
 
 	debug_print
 
-	if compare_floats_greater_or_equal "${reaver_version}" "${minimum_wash_dualscan_version}"; then
+	get_wash_version
+	if compare_floats_greater_or_equal "${wash_version}" "${minimum_wash_dualscan_version}"; then
 		return 0
 	fi
 	return 1
