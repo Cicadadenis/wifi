@@ -208,7 +208,8 @@ urlscript_pins_dbfile="https://raw.githubusercontent.com/${github_user}/${github
 urlscript_pins_dbfile_checksum="https://raw.githubusercontent.com/${github_user}/${github_repository}/${branch}/${pins_dbfile_checksum}"
 urlscript_language_strings_file="https://raw.githubusercontent.com/${github_user}/${github_repository}/${branch}/${language_strings_file}"
 urlscript_options_config_file="https://raw.githubusercontent.com/${github_user}/${github_repository}/${branch}/${rc_file_name}"
-dictionaries_subdir="dictionaries/"
+dictionaries_folder="/root/"
+preferred_wifi_interface="wlan0"
 url_dictionary_rockyou="https://github.com/brannondorsey/naive-hashcat/releases/download/data/rockyou.txt"
 url_dictionary_wpa_top4800="https://raw.githubusercontent.com/danielmiessler/SecLists/master/Passwords/WiFi-WPA/probable-v2-wpa-top4800.txt"
 dictionary_rockyou_filename="rockyou.txt"
@@ -738,23 +739,120 @@ function special_text_missed_optional_tool() {
 	fi
 }
 
+#Get the usable terminal width
+function get_terminal_width() {
+
+	debug_print
+
+	local width
+
+	width=$(tput cols 2> /dev/null)
+	[ -z "${width}" ] && width="${COLUMNS:-80}"
+	[ "${width}" -lt 20 ] && width=40
+	echo "${width}"
+}
+
+#Check if the terminal is too narrow for desktop layout
+function is_narrow_terminal() {
+
+	debug_print
+
+	[ "$(get_terminal_width)" -lt 72 ]
+}
+
+#Remove ANSI color codes from text
+function strip_ansi_codes() {
+
+	debug_print
+
+	echo -e "${1}" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g'
+}
+
+#Wrap plain text to fit the terminal width
+function wrap_plain_text() {
+
+	debug_print
+
+	local width="${1}"
+	local text="${2}"
+	local line=""
+	local line_len=0
+	local word
+	local word_len
+
+	for word in ${text}; do
+		word_len=${#word}
+		if [ "${line_len}" -eq 0 ]; then
+			line="${word}"
+			line_len=${word_len}
+		elif [ $((line_len + 1 + word_len)) -le "${width}" ]; then
+			line="${line} ${word}"
+			line_len=$((line_len + 1 + word_len))
+		else
+			echo "${line}"
+			line="${word}"
+			line_len=${word_len}
+		fi
+	done
+
+	[ -n "${line}" ] && echo "${line}"
+}
+
+#Print colored text with automatic line wrapping on narrow terminals
+function echo_wrapped_colored() {
+
+	debug_print
+
+	local color="${1}"
+	local text="${2}"
+	local width
+	local plain
+
+	width=$(get_terminal_width)
+	width=$((width - 2))
+	plain=$(strip_ansi_codes "${text}")
+
+	if is_narrow_terminal; then
+		while IFS= read -r line; do
+			echo -e "${color}${line}${normal_color}"
+		done < <(wrap_plain_text "${width}" "${plain}")
+	else
+		echo -e "${color}${text}${normal_color}"
+	fi
+}
+
 #Generate the chars in front of and behind a text for titles and separators
 function generate_dynamic_line() {
 
 	debug_print
 
 	local type=${2}
+	local width
+	local titletext=${1}
+	local titlelength=${#titletext}
+	local finaltitle=""
+	local ncharstitle
+	local titlechar
+	local i
+
+	width=$(get_terminal_width)
+
 	if [ "${type}" = "title" ]; then
-		ncharstitle=78
 		titlechar="*"
+		ncharstitle=$((width < 78 ? width : 78))
 	elif [ "${type}" = "separator" ]; then
-		ncharstitle=58
 		titlechar="-"
+		ncharstitle=$((width < 58 ? width : 58))
 	fi
 
-	titletext=${1}
-	titlelength=${#titletext}
-	finaltitle=""
+	if is_narrow_terminal || [ "${ncharstitle}" -le $((titlelength + 6)) ]; then
+		if [ "${type}" = "title" ]; then
+			echo_green_title "${titletext}"
+		else
+			echo_blue "-- ${titletext} --"
+		fi
+		return
+	fi
 
 	for ((i=0; i < (ncharstitle/2 - titlelength+(titlelength/2)); i++)); do
 		finaltitle="${finaltitle}${titlechar}"
@@ -762,7 +860,7 @@ function generate_dynamic_line() {
 
 	if [ "${type}" = "title" ]; then
 		finaltitle="${finaltitle} ${titletext} "
-	elif [ "${type}" = "separator" ]; then
+	else
 		finaltitle="${finaltitle} (${titletext}) "
 	fi
 
@@ -776,7 +874,7 @@ function generate_dynamic_line() {
 
 	if [ "${type}" = "title" ]; then
 		echo_green_title "${finaltitle}"
-	elif [ "${type}" = "separator" ]; then
+	else
 		echo_blue "${finaltitle}"
 	fi
 }
@@ -1756,6 +1854,59 @@ function disable_rfkill() {
 	if hash rfkill 2> /dev/null; then
 		rfkill unblock all > /dev/null 2>&1
 	fi
+}
+
+#Bring up the preferred wifi interface (wlan0 by default)
+function ensure_preferred_wifi_interface_up() {
+
+	debug_print
+
+	local iface="${preferred_wifi_interface}"
+	local attempt
+
+	disable_rfkill
+
+	for attempt in 1 2 3 4 5; do
+		if [ -d "/sys/class/net/${iface}" ]; then
+			ip link set "${iface}" up > /dev/null 2>&1
+			if check_interface_wifi "${iface}"; then
+				return 0
+			fi
+		fi
+		sleep 1
+	done
+
+	if [ -d "/sys/class/net/${iface}" ]; then
+		ip link set "${iface}" up > /dev/null 2>&1
+		check_interface_wifi "${iface}"
+		return $?
+	fi
+
+	return 1
+}
+
+#Auto-select preferred wifi interface if available
+function auto_select_preferred_interface() {
+
+	debug_print
+
+	local preferred="${preferred_wifi_interface}"
+
+	if ! ensure_preferred_wifi_interface_up; then
+		return 1
+	fi
+
+	if ! check_interface_wifi "${preferred}"; then
+		return 1
+	fi
+
+	interface="${preferred}"
+	phy_interface=$(physical_interface_finder "${interface}")
+	check_interface_supported_bands "${phy_interface}" "main_wifi_interface"
+	interface_mac=$(ip link show "${interface}" | awk '/ether/ {print $2}')
+	current_iface_on_messages="${interface}"
+	check_interface_mode "${interface}"
+	return 0
 }
 
 #Set the interface on managed mode and manage the possible name change
@@ -6055,7 +6206,7 @@ function dictionaries_menu() {
 	language_strings "${language}" 665
 	language_strings "${language}" 666
 	print_simple_separator
-	dict_folder="${scriptfolder}${dictionaries_subdir}"
+	dict_folder="${dictionaries_folder}"
 	language_strings "${language}" 672 "blue"
 	print_hint ${current_menu}
 
@@ -13727,12 +13878,12 @@ function download_options_config_file() {
 	fi
 }
 
-#Ensure dictionaries folder exists in script directory
+#Ensure dictionaries folder exists
 function ensure_dictionaries_folder() {
 
 	debug_print
 
-	mkdir -p "${scriptfolder}${dictionaries_subdir}" 2> /dev/null
+	mkdir -p "${dictionaries_folder}" 2> /dev/null
 }
 
 #Download a file from url to destination path
@@ -13784,7 +13935,7 @@ function download_dictionary_option() {
 	local dict_folder
 	local download_again=1
 
-	dict_folder="${scriptfolder}${dictionaries_subdir}"
+	dict_folder="${dictionaries_folder}"
 	dict_path="${dict_folder}${filename}"
 
 	if ! hash curl 2> /dev/null && ! hash wget 2> /dev/null; then
@@ -14235,10 +14386,16 @@ function print_known_distros() {
 	all_known_compatible_distros=($(printf "%s\n" "${all_known_compatible_distros[@]}" | sort))
 	unset IFS
 
-	for i in "${all_known_compatible_distros[@]}"; do
-		echo -ne "${pink_color}\"${i}\" ${normal_color}"
-	done
-	echo
+	if is_narrow_terminal; then
+		for i in "${all_known_compatible_distros[@]}"; do
+			echo -e "${pink_color}${i}${normal_color}"
+		done
+	else
+		for i in "${all_known_compatible_distros[@]}"; do
+			echo -ne "${pink_color}\"${i}\" ${normal_color}"
+		done
+		echo
+	fi
 }
 
 #Check if you have installed the tools (essential and optional) that the script uses
@@ -14258,15 +14415,27 @@ function check_compatibility() {
 	essential_toolsok=1
 	for i in "${essential_tools_names[@]}"; do
 		if ! "${SATANA_SILENT_CHECKS:-false}"; then
-			echo -ne "${i}"
-			time_loop
-			if ! hash "${i}" 2> /dev/null; then
-				echo -ne "${red_color} Error${normal_color}"
-				essential_toolsok=0
-				echo -ne " (${possible_package_names_text[${language}]} : ${possible_package_names[${i}]})"
-				echo -e "\r"
+			if is_narrow_terminal; then
+				echo -ne "${i}"
+				time_loop
+				if ! hash "${i}" 2> /dev/null; then
+					echo -e " ${red_color}Error${normal_color}"
+					echo -e "  (${possible_package_names_text[${language}]}: ${possible_package_names[${i}]})"
+					essential_toolsok=0
+				else
+					echo -e " ${green_color}Ok${normal_color}"
+				fi
 			else
-				echo -e "${green_color} Ok\r${normal_color}"
+				echo -ne "${i}"
+				time_loop
+				if ! hash "${i}" 2> /dev/null; then
+					echo -ne "${red_color} Error${normal_color}"
+					essential_toolsok=0
+					echo -ne " (${possible_package_names_text[${language}]} : ${possible_package_names[${i}]})"
+					echo -e "\r"
+				else
+					echo -e "${green_color} Ok\r${normal_color}"
+				fi
 			fi
 		else
 			if ! hash "${i}" 2> /dev/null; then
@@ -15632,7 +15801,16 @@ function print_simple_separator() {
 
 	debug_print
 
-	echo_blue "---------"
+	local width
+	local separator
+
+	if is_narrow_terminal; then
+		width=$(get_terminal_width)
+		separator=$(printf '%*s' "${width}" '' | tr ' ' '-')
+		echo_blue "${separator}"
+	else
+		echo_blue "---------"
+	fi
 }
 
 #Print a large separator
@@ -15640,7 +15818,16 @@ function print_large_separator() {
 
 	debug_print
 
-	echo_blue "-------------------------------------------------------"
+	local width
+	local separator
+
+	if is_narrow_terminal; then
+		width=$(get_terminal_width)
+		separator=$(printf '%*s' "${width}" '' | tr ' ' '-')
+		echo_blue "${separator}"
+	else
+		echo_blue "-------------------------------------------------------"
+	fi
 }
 
 #Add the PoT prefix on printed strings if PoT mark is found
@@ -15681,10 +15868,18 @@ function last_echo() {
 
 	debug_print
 
+	local message
+
 	if ! check_pending_of_translation "${1}" "${2}"; then
-		echo -e "${2}${text}${normal_color}"
+		message="${text}"
 	else
-		echo -e "${2}$*${normal_color}"
+		message="${1}"
+	fi
+
+	if is_narrow_terminal; then
+		echo_wrapped_colored "${2}" "${message}"
+	else
+		echo -e "${2}${message}${normal_color}"
 	fi
 }
 
@@ -15733,7 +15928,11 @@ function echo_green_title() {
 
 	debug_print
 
-	last_echo "${1}" "${green_color_title}"
+	if is_narrow_terminal; then
+		echo_wrapped_colored "${green_color_title}" "${1}"
+	else
+		last_echo "${1}" "${green_color_title}"
+	fi
 }
 
 #Print pink messages
@@ -15878,7 +16077,9 @@ function main() {
 	print_configuration_vars_issues
 	initialize_extended_colorized_output
 	set_windows_sizes
-	select_interface
+	if ! auto_select_preferred_interface; then
+		select_interface
+	fi
 	initialize_menu_options_dependencies
 	remove_warnings
 	main_menu
