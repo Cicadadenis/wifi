@@ -958,6 +958,10 @@ function is_selectable_wifi_interface() {
 		;;
 	esac
 
+	if is_wlan0_interface "${iface}"; then
+		return 0
+	fi
+
 	phy=$(physical_interface_finder "${iface}")
 	[ -n "${phy}" ] || return 1
 	iw phy "${phy}" info 2>/dev/null | grep -q "monitor" || return 1
@@ -1165,7 +1169,7 @@ function repair_broken_monitor_interface() {
 
 	disable_rfkill
 	check_airmon_compatibility "interface"
-	if is_builtin_mobile_wifi "${iface}" && ! is_wlan0_interface "${iface}"; then
+	if is_wlan0_interface "${iface}" || is_builtin_mobile_wifi "${iface}"; then
 		kill_wifi_conflicting_processes
 	elif [ "${interface_airmon_compatible}" -eq 1 ] && [ "${check_kill_needed}" -eq 1 ]; then
 		${airmon} check kill > /dev/null 2>&1
@@ -1173,7 +1177,17 @@ function repair_broken_monitor_interface() {
 	fi
 	ip link set "${iface}" up > /dev/null 2>&1
 
-	if [ "${interface_airmon_compatible}" -eq 1 ] || is_wlan0_interface "${iface}"; then
+	if is_wlan0_interface "${iface}" || is_builtin_mobile_wifi "${iface}"; then
+		if set_builtin_wifi_monitor_mode "${iface}"; then
+			if [ "$(get_interface_mode "${iface}")" = "monitor" ]; then
+				new_iface="${iface}"
+			else
+				new_iface=$(find_monitor_interface_by_phy "${iface}")
+			fi
+		fi
+	fi
+
+	if [ -z "${new_iface}" ] && { [ "${interface_airmon_compatible}" -eq 1 ] || is_wlan0_interface "${iface}"; }; then
 		airmon_start_output=$(airmon_start_interface "${iface}" 2>&1)
 		new_iface=$(parse_airmon_start_output "${iface}" "${airmon_start_output}")
 	fi
@@ -1429,6 +1443,45 @@ function kill_wifi_conflicting_processes() {
 	fi
 
 	nm_processes_killed=1
+}
+
+#Enable monitor mode on built-in wlan0/mobile adapters via iw
+function set_builtin_wifi_monitor_mode() {
+
+	debug_print
+
+	local iface="${1}"
+	local phy
+	local mon_iface
+
+	kill_wifi_conflicting_processes
+	disable_rfkill
+	ip link set "${iface}" down > /dev/null 2>&1
+
+	if iw dev "${iface}" set type monitor > /dev/null 2>&1 \
+		|| iw "${iface}" set type monitor > /dev/null 2>&1 \
+		|| iw "${iface}" set monitor control > /dev/null 2>&1; then
+		ip link set "${iface}" up > /dev/null 2>&1
+		if [ "$(get_interface_mode "${iface}")" = "monitor" ]; then
+			return 0
+		fi
+	fi
+
+	phy=$(physical_interface_finder "${iface}")
+	if [ -n "${phy}" ]; then
+		mon_iface="mon${phy#phy}"
+		if iw phy "${phy}" interface add "${mon_iface}" type monitor 2> /dev/null; then
+			ip link set "${mon_iface}" up > /dev/null 2>&1
+			if [ "$(get_interface_mode "${mon_iface}")" = "monitor" ]; then
+				return 0
+			fi
+		fi
+	fi
+
+	ip link set "${iface}" up > /dev/null 2>&1
+	[ "$(get_interface_mode "${iface}")" = "monitor" ] && return 0
+	find_monitor_interface_by_phy "${iface}" > /dev/null && return 0
+	return 1
 }
 
 #Automatically enable monitor mode when possible
@@ -2103,10 +2156,43 @@ function monitor_option() {
 	if [ "${1}" = "${interface}" ]; then
 		check_airmon_compatibility "interface"
 
-		if [ "${interface_airmon_compatible}" -eq 0 ] && ! is_wlan0_interface "${1}"; then
-			if is_builtin_mobile_wifi "${1}"; then
-				kill_wifi_conflicting_processes
+		if is_wlan0_interface "${1}" || is_builtin_mobile_wifi "${1}"; then
+			if set_builtin_wifi_monitor_mode "${1}"; then
+				if [ "$(get_interface_mode "${1}")" = "monitor" ]; then
+					new_interface="${1}"
+				else
+					new_interface=$(find_monitor_interface_by_phy "${1}")
+				fi
 			fi
+
+			if [ -z "${new_interface}" ]; then
+				if [ "${check_kill_needed}" -eq 1 ]; then
+					language_strings "${language}" 19 "blue"
+					${airmon} check kill > /dev/null 2>&1
+					nm_processes_killed=1
+				fi
+
+				desired_interface_name=""
+				airmon_start_output=$(airmon_start_interface "${1}" 2>&1)
+				[[ ${airmon_start_output} =~ ^You[[:space:]]already[[:space:]]have[[:space:]]a[[:space:]]([A-Za-z0-9]+)[[:space:]]device ]] && desired_interface_name="${BASH_REMATCH[1]}"
+				new_interface=$(parse_airmon_start_output "${1}" "${airmon_start_output}")
+
+				if [ -n "${desired_interface_name}" ]; then
+					echo
+					language_strings "${language}" 435 "red"
+					language_strings "${language}" 115 "read"
+					return 1
+				fi
+			fi
+
+			if [ -z "${new_interface}" ]; then
+				if set_mode_without_airmon "${1}" "monitor"; then
+					new_interface="${1}"
+				else
+					new_interface=$(find_monitor_interface_by_phy "${1}")
+				fi
+			fi
+		elif [ "${interface_airmon_compatible}" -eq 0 ]; then
 			if set_mode_without_airmon "${1}" "monitor"; then
 				new_interface="${1}"
 			else
@@ -2242,11 +2328,12 @@ function set_mode_without_airmon() {
 	local error
 	local mode
 
-	if is_wlan0_interface "${1}"; then
-		return 1
+	if [ "${2}" = "monitor" ] && { is_wlan0_interface "${1}" || is_builtin_mobile_wifi "${1}"; }; then
+		set_builtin_wifi_monitor_mode "${1}"
+		return $?
 	fi
 
-	if [ "${2}" = "monitor" ] && is_builtin_mobile_wifi "${1}"; then
+	if [ "${2}" = "monitor" ]; then
 		kill_wifi_conflicting_processes
 	fi
 
@@ -2257,7 +2344,7 @@ function set_mode_without_airmon() {
 		iw dev "${1}" set type monitor > /dev/null 2>&1 || iw "${1}" set type monitor > /dev/null 2>&1 || iw "${1}" set monitor control > /dev/null 2>&1
 	else
 		mode="managed"
-		iw "${1}" set type managed > /dev/null 2>&1
+		iw dev "${1}" set type managed > /dev/null 2>&1 || iw "${1}" set type managed > /dev/null 2>&1
 	fi
 
 	error=$?
@@ -3185,6 +3272,8 @@ function select_interface() {
 				phy_interface=$(physical_interface_finder "${interface}")
 				check_interface_supported_bands "${phy_interface}" "main_wifi_interface"
 				interface_mac=$(ip link show "${interface}" | awk '/ether/ {print $2}')
+				current_iface_on_messages="${interface}"
+				check_interface_mode "${interface}"
 				break
 			fi
 		done
@@ -16204,9 +16293,8 @@ function main() {
 	print_configuration_vars_issues
 	initialize_extended_colorized_output
 	set_windows_sizes
-	if ! auto_select_preferred_interface; then
-		select_interface
-	elif "${SATANA_AUTO_MONITOR:-true}" && is_builtin_mobile_wifi "${interface}"; then
+	select_interface
+	if [ -n "${interface}" ] && "${SATANA_AUTO_MONITOR:-true}" && { is_wlan0_interface "${interface}" || is_builtin_mobile_wifi "${interface}"; }; then
 		auto_enable_monitor_mode > /dev/null 2>&1
 	fi
 	initialize_menu_options_dependencies
