@@ -19,6 +19,9 @@ SATANA_SILENT_CHECKS=false
 #Enabled true / Disabled false - Print help hints on menus - Default value true
 SATANA_PRINT_HINTS=false
 
+#Enabled true / Disabled false - Auto enable monitor mode on built-in mobile wifi (wlan0) at startup - Default value true
+SATANA_AUTO_MONITOR=true
+
 #Enabled true / Disabled false - Enable 5Ghz support (it has no effect if your cards are not 5Ghz compatible cards) - Default value true
 SATANA_5GHZ_ENABLED=true
 

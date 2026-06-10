@@ -1095,7 +1095,7 @@ function restore_managed_mode_interface() {
 	fi
 
 	check_airmon_compatibility "interface"
-	if [ "${interface_airmon_compatible}" -eq 0 ]; then
+	if [ "${interface_airmon_compatible}" -eq 0 ] && ! is_wlan0_interface "${iface}"; then
 		if set_mode_without_airmon "${iface}" "managed"; then
 			echo "${iface}"
 			return 0
@@ -1103,7 +1103,7 @@ function restore_managed_mode_interface() {
 		return 1
 	fi
 
-	airmon_stop_output=$(${airmon} stop "${iface}" 2> /dev/null)
+	airmon_stop_output=$(airmon_stop_interface "${iface}" 2> /dev/null)
 	mode_after_stop=$(get_interface_mode "${iface}")
 
 	if [ "${mode_after_stop}" = "managed" ]; then
@@ -1147,8 +1147,8 @@ function repair_broken_monitor_interface() {
 
 	if is_valid_wifi_interface "${iface}" && [ "$(get_interface_mode "${iface}")" = "monitor" ]; then
 		check_airmon_compatibility "interface"
-		if [ "${interface_airmon_compatible}" -eq 1 ]; then
-			${airmon} stop "${iface}" > /dev/null 2>&1
+		if [ "${interface_airmon_compatible}" -eq 1 ] || is_wlan0_interface "${iface}"; then
+			airmon_stop_interface "${iface}" > /dev/null 2>&1
 		else
 			set_mode_without_airmon "${iface}" "managed" > /dev/null 2>&1
 		fi
@@ -1165,14 +1165,16 @@ function repair_broken_monitor_interface() {
 
 	disable_rfkill
 	check_airmon_compatibility "interface"
-	if [ "${interface_airmon_compatible}" -eq 1 ] && [ "${check_kill_needed}" -eq 1 ]; then
+	if is_builtin_mobile_wifi "${iface}" && ! is_wlan0_interface "${iface}"; then
+		kill_wifi_conflicting_processes
+	elif [ "${interface_airmon_compatible}" -eq 1 ] && [ "${check_kill_needed}" -eq 1 ]; then
 		${airmon} check kill > /dev/null 2>&1
 		nm_processes_killed=1
 	fi
 	ip link set "${iface}" up > /dev/null 2>&1
 
-	if [ "${interface_airmon_compatible}" -eq 1 ]; then
-		airmon_start_output=$(${airmon} start "${iface}" 2>&1)
+	if [ "${interface_airmon_compatible}" -eq 1 ] || is_wlan0_interface "${iface}"; then
+		airmon_start_output=$(airmon_start_interface "${iface}" 2>&1)
 		new_iface=$(parse_airmon_start_output "${iface}" "${airmon_start_output}")
 	fi
 
@@ -1319,6 +1321,43 @@ function get_wifi_driver() {
 	fi
 }
 
+#Check if interface is wlan0 (always uses airmon-ng start/stop wlan0)
+function is_wlan0_interface() {
+
+	debug_print
+
+	[ "$(get_base_wifi_interface_name "${1}")" = "wlan0" ]
+}
+
+#Start monitor mode via airmon-ng for wlan0, ${airmon} for other interfaces
+function airmon_start_interface() {
+
+	debug_print
+
+	local iface="${1}"
+
+	shift
+	if is_wlan0_interface "${iface}"; then
+		airmon-ng start wlan0 "$@"
+	else
+		${airmon} start "${iface}" "$@"
+	fi
+}
+
+#Stop monitor mode via airmon-ng for wlan0, ${airmon} for other interfaces
+function airmon_stop_interface() {
+
+	debug_print
+
+	local iface="${1}"
+
+	if is_wlan0_interface "${iface}"; then
+		airmon-ng stop wlan0
+	else
+		${airmon} stop "${iface}"
+	fi
+}
+
 #Check if airmon-ng can be safely used on this interface
 function should_use_airmon_for_interface() {
 
@@ -1328,6 +1367,10 @@ function should_use_airmon_for_interface() {
 	local driver
 
 	[ -n "${iface}" ] || return 1
+
+	if is_wlan0_interface "${iface}"; then
+		return 0
+	fi
 
 	driver=$(get_wifi_driver "${iface}")
 	case "${driver}" in
@@ -1343,11 +1386,77 @@ function should_use_airmon_for_interface() {
 	return 0
 }
 
+#Check if the interface is a built-in mobile wifi adapter
+function is_builtin_mobile_wifi() {
+
+	debug_print
+
+	local iface="${1}"
+	local driver
+
+	[ -n "${iface}" ] || return 1
+
+	driver=$(get_wifi_driver "${iface}")
+	case "${driver}" in
+		icnss|icnss2|cnss|cnss_pci|wlcore|bcmdhd|brcmfmac)
+			return 0
+		;;
+	esac
+
+	if [ ! -f "/sys/class/net/${iface}/device/modalias" ]; then
+		return 0
+	fi
+
+	return 1
+}
+
+#Stop processes that block monitor mode on mobile devices
+function kill_wifi_conflicting_processes() {
+
+	debug_print
+
+	if hash airmon-ng 2> /dev/null; then
+		${airmon} check kill > /dev/null 2>&1
+	fi
+
+	for proc in wpa_supplicant dhcpcd hostapd connmand dnsmasq; do
+		killall "${proc}" 2> /dev/null
+	done
+
+	if hash systemctl 2> /dev/null; then
+		systemctl stop wpa_supplicant 2> /dev/null
+		systemctl stop NetworkManager 2> /dev/null
+	fi
+
+	nm_processes_killed=1
+}
+
+#Automatically enable monitor mode when possible
+function auto_enable_monitor_mode() {
+
+	debug_print
+
+	validate_selected_interface || return 1
+
+	if check_monitor_enabled "${interface}"; then
+		ifacemode="Monitor"
+		return 0
+	fi
+
+	monitor_option "${interface}"
+}
+
 function check_airmon_compatibility() {
 
 	debug_print
 
 	if [ "${1}" = "interface" ]; then
+		if is_wlan0_interface "${interface}"; then
+			set_chipset "${interface}" "read_only"
+			interface_airmon_compatible=1
+			return 0
+		fi
+
 		set_chipset "${interface}" "read_only"
 
 		local phy
@@ -1813,8 +1922,8 @@ function restore_et_interface() {
 		set_mode_without_airmon "${interface}" "managed"
 		ifacemode="Managed"
 	else
-		if [ "${interface_airmon_compatible}" -eq 1 ]; then
-			airmon_start_output=$(${airmon} start "${interface}" 2> /dev/null)
+		if [ "${interface_airmon_compatible}" -eq 1 ] || is_wlan0_interface "${interface}"; then
+			airmon_start_output=$(airmon_start_interface "${interface}" 2> /dev/null)
 			desired_interface_name=""
 			[[ ${airmon_start_output} =~ ^You[[:space:]]already[[:space:]]have[[:space:]]a[[:space:]]([A-Za-z0-9]+)[[:space:]]device ]] && desired_interface_name="${BASH_REMATCH[1]}"
 			if [ -n "${desired_interface_name}" ]; then
@@ -1924,7 +2033,7 @@ function managed_option() {
 	ip link set "${1}" up > /dev/null 2>&1
 
 	if [ "${1}" = "${interface}" ]; then
-		if [ "${interface_airmon_compatible}" -eq 0 ]; then
+		if [ "${interface_airmon_compatible}" -eq 0 ] && ! is_wlan0_interface "${1}"; then
 			if ! set_mode_without_airmon "${1}" "managed"; then
 				echo
 				language_strings "${language}" 1 "red"
@@ -1994,7 +2103,10 @@ function monitor_option() {
 	if [ "${1}" = "${interface}" ]; then
 		check_airmon_compatibility "interface"
 
-		if [ "${interface_airmon_compatible}" -eq 0 ]; then
+		if [ "${interface_airmon_compatible}" -eq 0 ] && ! is_wlan0_interface "${1}"; then
+			if is_builtin_mobile_wifi "${1}"; then
+				kill_wifi_conflicting_processes
+			fi
 			if set_mode_without_airmon "${1}" "monitor"; then
 				new_interface="${1}"
 			else
@@ -2008,7 +2120,7 @@ function monitor_option() {
 			fi
 
 			desired_interface_name=""
-			airmon_start_output=$(${airmon} start "${1}" 2>&1)
+			airmon_start_output=$(airmon_start_interface "${1}" 2>&1)
 			[[ ${airmon_start_output} =~ ^You[[:space:]]already[[:space:]]have[[:space:]]a[[:space:]]([A-Za-z0-9]+)[[:space:]]device ]] && desired_interface_name="${BASH_REMATCH[1]}"
 			new_interface=$(parse_airmon_start_output "${1}" "${airmon_start_output}")
 
@@ -2073,7 +2185,7 @@ function monitor_option() {
 			fi
 
 			secondary_interface_airmon_compatible=1
-			airmon_start_output=$(${airmon} start "${1}" 2> /dev/null)
+			airmon_start_output=$(airmon_start_interface "${1}" 2> /dev/null)
 			[[ ${airmon_start_output} =~ ^You[[:space:]]already[[:space:]]have[[:space:]]a[[:space:]]([A-Za-z0-9]+)[[:space:]]device ]] && desired_interface_name="${BASH_REMATCH[1]}"
 			new_secondary_interface=$(parse_airmon_start_output "${1}" "${airmon_start_output}")
 
@@ -2130,11 +2242,19 @@ function set_mode_without_airmon() {
 	local error
 	local mode
 
+	if is_wlan0_interface "${1}"; then
+		return 1
+	fi
+
+	if [ "${2}" = "monitor" ] && is_builtin_mobile_wifi "${1}"; then
+		kill_wifi_conflicting_processes
+	fi
+
 	ip link set "${1}" down > /dev/null 2>&1
 
 	if [ "${2}" = "monitor" ]; then
 		mode="monitor"
-		iw "${1}" set type monitor > /dev/null 2>&1 || iw "${1}" set monitor control > /dev/null 2>&1
+		iw dev "${1}" set type monitor > /dev/null 2>&1 || iw "${1}" set type monitor > /dev/null 2>&1 || iw "${1}" set monitor control > /dev/null 2>&1
 	else
 		mode="managed"
 		iw "${1}" set type managed > /dev/null 2>&1
@@ -4164,7 +4284,7 @@ function set_wep_script() {
 		#shellcheck disable=SC1037
 		#shellcheck disable=SC2164
 		#shellcheck disable=SC2140
-		${airmon} start "${interface}" "${channel}" > /dev/null 2>&1
+		airmon_start_interface "${interface}" "${channel}" > /dev/null 2>&1
 		mkdir "${tmpdir}${wepdir}" > /dev/null 2>&1
 		cd "${tmpdir}${wepdir}" > /dev/null 2>&1
 	EOF
@@ -4680,7 +4800,7 @@ function launch_dos_pursuit_mode_attack() {
 			fi
 		;;
 		"aireplay deauth attack")
-			${airmon} start "${interface}" "${channel}" > /dev/null 2>&1
+			airmon_start_interface "${interface}" "${channel}" > /dev/null 2>&1
 			dos_delay=3
 			interface_pursuit_mode_scan="${interface}"
 			interface_pursuit_mode_deauth="${interface}"
@@ -4926,7 +5046,7 @@ function exec_aireplaydeauth() {
 		launch_dos_pursuit_mode_attack "aireplay deauth attack" "first_time"
 		pid_control_pursuit_mode "aireplay deauth attack"
 	else
-		${airmon} start "${interface}" "${channel}" > /dev/null 2>&1
+		airmon_start_interface "${interface}" "${channel}" > /dev/null 2>&1
 
 		language_strings "${language}" 33 "yellow"
 		language_strings "${language}" 4 "read"
@@ -10067,8 +10187,8 @@ function set_enterprise_control_script() {
 				ip link set "${interface}" up > /dev/null 2>&1
 				ifacemode="Managed"
 			else
-				if [ "${interface_airmon_compatible}" -eq 1 ]; then
-					airmon_start_output=$(${airmon} start "${interface}" 2> /dev/null)
+				if [ "${interface_airmon_compatible}" -eq 1 ] || is_wlan0_interface "${interface}"; then
+					airmon_start_output=$(airmon_start_interface "${interface}" 2> /dev/null)
 					new_interface=$(parse_airmon_start_output "${interface}" "${airmon_start_output}")
 					if [ -z "${new_interface}" ]; then
 						set_mode_without_airmon "${interface}" "monitor" > /dev/null 2>&1
@@ -11718,7 +11838,7 @@ function capture_handshake_evil_twin() {
 			sleeptimeattack=12
 		;;
 		"Aireplay")
-			${airmon} start "${interface}" "${channel}" > /dev/null 2>&1
+			airmon_start_interface "${interface}" "${channel}" > /dev/null 2>&1
 			recalculate_windows_sizes
 			manage_output "+j -bg \"#000000\" -fg \"#FF0000\" -geometry ${g1_bottomleft_window} -T \"aireplay deauth attack\"" "aireplay-ng --deauth 0 -a ${bssid} --ignore-negative-one ${interface}" "aireplay deauth attack"
 			if [ "${SATANA_WINDOWS_HANDLING}" = "tmux" ]; then
@@ -12222,7 +12342,7 @@ function dos_handshake_menu() {
 			else
 				ask_timeout "capture_handshake"
 				capture_handshake_window
-				${airmon} start "${interface}" "${channel}" > /dev/null 2>&1
+				airmon_start_interface "${interface}" "${channel}" > /dev/null 2>&1
 				recalculate_windows_sizes
 				manage_output "+j -bg \"#000000\" -fg \"#FF0000\" -geometry ${g1_bottomleft_window} -T \"aireplay deauth attack\"" "aireplay-ng --deauth 0 -a ${bssid} --ignore-negative-one ${interface}" "aireplay deauth attack"
 				if [ "${SATANA_WINDOWS_HANDLING}" = "tmux" ]; then
@@ -12346,14 +12466,21 @@ function explore_for_targets_option() {
 	sync_monitor_interface_reference "${interface}"
 
 	if ! check_monitor_enabled "${interface}"; then
-		repair_broken_monitor_interface
+		if is_builtin_mobile_wifi "${interface}"; then
+			language_strings "${language}" 18 "blue"
+			auto_enable_monitor_mode || repair_broken_monitor_interface
+		else
+			repair_broken_monitor_interface
+		fi
 	fi
 
 	if ! check_monitor_enabled "${interface}"; then
-		echo
-		language_strings "${language}" 14 "red"
-		language_strings "${language}" 115 "read"
-		return 1
+		if ! auto_enable_monitor_mode; then
+			echo
+			language_strings "${language}" 14 "red"
+			language_strings "${language}" 115 "read"
+			return 1
+		fi
 	fi
 
 	echo
@@ -13411,8 +13538,8 @@ function exit_script_option() {
 		if [ "${yesno}" = "n" ]; then
 			action_on_exit_taken=1
 			language_strings "${language}" 167 "multiline"
-			if [ "${interface_airmon_compatible}" -eq 1 ]; then
-				${airmon} stop "${interface}" > /dev/null 2>&1
+			if [ "${interface_airmon_compatible}" -eq 1 ] || is_wlan0_interface "${interface}"; then
+				airmon_stop_interface "${interface}" > /dev/null 2>&1
 			else
 				set_mode_without_airmon "${interface}" "managed"
 			fi
@@ -13482,8 +13609,8 @@ function hardcore_exit() {
 	exit_code=2
 	if [ "${ifacemode}" = "Monitor" ]; then
 		check_airmon_compatibility "interface"
-		if [ "${interface_airmon_compatible}" -eq 1 ]; then
-			${airmon} stop "${interface}" > /dev/null 2>&1
+		if [ "${interface_airmon_compatible}" -eq 1 ] || is_wlan0_interface "${interface}"; then
+			airmon_stop_interface "${interface}" > /dev/null 2>&1
 		else
 			set_mode_without_airmon "${interface}" "managed" > /dev/null 2>&1
 		fi
@@ -16079,6 +16206,8 @@ function main() {
 	set_windows_sizes
 	if ! auto_select_preferred_interface; then
 		select_interface
+	elif "${SATANA_AUTO_MONITOR:-true}" && is_builtin_mobile_wifi "${interface}"; then
+		auto_enable_monitor_mode > /dev/null 2>&1
 	fi
 	initialize_menu_options_dependencies
 	remove_warnings
